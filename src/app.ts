@@ -1,5 +1,10 @@
-console.log('Hello world!!! blah');
+import Redis from 'ioredis';
+import { HuddleParser } from './HuddleParser';
 
-export function testFunc() {
-  return 42
+const redis = new Redis(); // uses defaults unless given configuration object
+async function run() {
+  const parser = new HuddleParser(redis);
+  parser.getFolders();
 }
+
+run();
