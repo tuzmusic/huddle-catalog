@@ -4,7 +4,13 @@ import { HuddleParser } from './HuddleParser';
 const redis = new Redis(); // uses defaults unless given configuration object
 async function run() {
   const parser = new HuddleParser(process.env.HUDDLE_ROOT, redis);
-  parser.getRootFolders();
+  await parser.getRootFolders();
+  await parser.populateRootFolders();
 }
 
-run();
+// run();
+
+redis.get('folder:root').then(d => {
+  const root = JSON.parse(d);
+  console.log(root);
+});

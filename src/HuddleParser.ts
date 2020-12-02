@@ -31,6 +31,7 @@ export class HuddleParser {
   private page: puppeteer.Page;
   private browser: puppeteer.Browser = null;
   private redis: Redis.Redis;
+  private loggedIn = false;
   
   constructor(baseUrl: string, redis: Redis.Redis) {
     this.redis = redis;
@@ -51,7 +52,9 @@ export class HuddleParser {
     this.browser = this.browser || await puppeteer.launch({ headless: false });
     this.page = this.page || await this.browser.newPage();
     await this.page.goto(url);
-    await this.page.waitForSelector('[data-part="header"]', { visible: true });
+    await this.page.waitForSelector(this.loggedIn
+      ? '.workspace-nav-widget__inapphelp-wrapper'
+      : '[data-part="header"]', { visible: true });
     const currentUrl = await this.page.url();
     if (currentUrl.startsWith('https://login.huddle.net'))
       await this.logIn();
@@ -69,14 +72,18 @@ export class HuddleParser {
     await page.waitForSelector(usernameSel, { visible: true });
     await delay(500);
     await page.type(usernameSel, process.env.HUDDLE_USERNAME);
+    await page.waitForSelector(buttonSel, { visible: true });
     await page.click(buttonSel);
   
     // enter password and continue
     await page.waitForSelector(passwordSel, { visible: true });
     await delay(500);
     await page.type(passwordSel, process.env.HUDDLE_PASSWORD);
+    await page.waitForSelector(buttonSel, { visible: true });
     await page.click(buttonSel);
     await page.waitForSelector('#list-search', { visible: true });
+  
+    this.loggedIn = true;
   }
   
   async getRootFolders() {
@@ -84,47 +91,72 @@ export class HuddleParser {
   }
   
   async populateRootFolders() {
+    for (const folder of this.huddle.rootFolder.subfolders) {
+      await this.getFolderContents(folder);
+    }
   
+    await this.redis.set('folder:root', JSON.stringify(this.huddle.rootFolder));
+  
+    console.log('done');
   }
   
   async getFolderContents(folder: Folder, recursive = true) {
-    const { id, rootFolderId } = folder;
-    
+    const { id } = folder;
+  
     // get the html for the folder list page if we don't already have it
     const key = 'folder-html:' + id;
     let folderHtml = await this.redis.get(key);
+  
+    console.log(folderHtml ? 'Parsing' : 'Getting', 'contents of', folder.name, 'at', folder.url);
+  
     if (!folderHtml) {
       await this.visit(urlForFolder(id));
       folderHtml = await this.page.content();
       await this.redis.set(key, folderHtml);
     }
-    
-    // get folders from list page
+  
     const $ = cheerio.load(folderHtml);
-    const folderLinks = $('a.files-list__label');
+  
+    // get files
+    const fileLinks = $('li.file > a[data-automation="file-name"]');
+    fileLinks.each((i, link) => {
+      const name = link.firstChild.data;
+      const url = link.attribs.href;
     
+      const newFile: File = { name, url, rootFolderId: folder.id };
+      folder.files.push(newFile);
+    });
+  
     // populate subfolders
-    folderLinks.each((i, link) => {
+    const folderLinks = $('li.folder > a[data-automation="file-name"]');
+  
+    const folderEls: cheerio.Element[] = [];
+  
+    folderLinks.each((i, link) => folderEls.push(link));
+  
+    for (const link of folderEls) {
       const folderName = link.firstChild.data;
       const folderUrl = link.attribs.href;
-      
+    
       const newFolder: Folder = {
         // move leading number to the end, in parens
         // delete those parens if they're empty.
         name: folderName.replace(/([0-9]*)\s(.*)/, '$2 ($1)').replace(' ()', ''),
         url: folderUrl,
         id: folderUrl.match(/folder\/([0-9]*)\/list/)[1],
-        rootFolderId,
+        rootFolderId: folder.id,
         files: [],
         subfolders: [],
       };
-      
+    
       if (Object.values(newFolder).some(v => !v))
         throw new Error('There was a problem parsing the folder: ' + JSON.stringify(newFolder, null, 2));
-      
+    
       folder.subfolders.push(newFolder);
-    });
-    console.log(folder);
+    
+      if (recursive)
+        await this.getFolderContents(newFolder);
+    }
   }
 }
 
