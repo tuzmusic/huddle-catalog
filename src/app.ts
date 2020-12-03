@@ -20,5 +20,5 @@ async function inspect() {
   console.log(root);
 }
 
-run().then(inspect);
-// inspect()
+// run().then(inspect);
+inspect()
