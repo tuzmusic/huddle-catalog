@@ -22,38 +22,33 @@ type Folder = {
 
 type HuddleInstance = {
   rootFolder: Folder;
-  baseUrl: string;
 }
 
 export class HuddleParser {
   
-  huddle: HuddleInstance;
+  huddle: HuddleInstance = {
+    rootFolder: {
+      name: 'root',
+      id: 'root',
+      url: urlForFolder('root'),
+      rootFolderId: '/',
+      subfolders: [],
+      files: [],
+    },
+  };
+  
   private page: puppeteer.Page;
   private browser: puppeteer.Browser = null;
-  private redis: Redis.Redis;
   private loggedIn = false;
   
-  constructor(baseUrl: string, redis: Redis.Redis) {
-    this.redis = redis;
-    this.huddle = {
-      baseUrl,
-      rootFolder: {
-        name: 'root',
-        id: 'root',
-        url: urlForFolder('root'),
-        rootFolderId: '/',
-        subfolders: [],
-        files: [],
-      },
-    };
-  }
+  constructor(private redis: Redis.Redis, private fetchDelay = 0, private alwaysFetch = false) {}
   
   async visit(url: string) {
     this.browser = this.browser || await puppeteer.launch({ headless: false });
     this.page = this.page || await this.browser.newPage();
     await this.page.goto(url);
     await this.page.waitForSelector(this.loggedIn
-      ? '.workspace-nav-widget__inapphelp-wrapper'
+      ? 'a[data-automation="file-name"]'
       : '[data-part="header"]', { visible: true });
     const currentUrl = await this.page.url();
     if (currentUrl.startsWith('https://login.huddle.net'))
@@ -95,67 +90,87 @@ export class HuddleParser {
       await this.getFolderContents(folder);
     }
   
-    await this.redis.set('folder:root', JSON.stringify(this.huddle.rootFolder));
+    const data = JSON.stringify(this.huddle.rootFolder);
+    await this.redis.set('folder:root', data);
+    await this.redis.set('history:folder:root:' + new Date().toISOString(), data);
   
-    console.log('done');
+    // this doesn't seem to set different scores each time and just overwrites the existing element.
+    // that's why we're covering our bases above.
+    await this.redis.zadd('history:folder:root', new Date().toISOString(), data);
+  
+    console.log('Done');
   }
   
-  async getFolderContents(folder: Folder, recursive = true) {
-    const { id } = folder;
-  
+  async getHtmlForFolder(folder: Folder): Promise<string> {
+    
     // get the html for the folder list page if we don't already have it
+    const { url, id, name } = folder;
     const key = 'folder-html:' + id;
     let folderHtml = await this.redis.get(key);
-  
-    console.log(folderHtml ? 'Parsing' : 'Getting', 'contents of', folder.name, 'at', folder.url);
-  
-    if (!folderHtml) {
+    
+    console.log(folderHtml ? 'Parsing' : 'Getting', 'contents of', name, 'at', url);
+    
+    if (!folderHtml || this.alwaysFetch) {
       await this.visit(urlForFolder(id));
+      await delay(this.fetchDelay);
       folderHtml = await this.page.content();
       await this.redis.set(key, folderHtml);
     }
+    return folderHtml;
+  }
   
+  getFileInfoFromElement(link: cheerio.Element, rootFolder: Folder): File {
+    const name = link.firstChild.data;
+    const url = link.attribs.href;
+    return { name, url, rootFolderId: rootFolder.id };
+  }
+  
+  getFolderInfoFromElement(link: cheerio.Element, rootFolder: Folder): Folder {
+    const folderName = link.firstChild.data;
+    const folderUrl = link.attribs.href;
+    
+    const newFolder: Folder = {
+      // move leading number to the end, in parens
+      // delete those parens if they're empty.
+      name: folderName.replace(/([0-9]*)\s(.*)/, '$2 ($1)').replace(' ()', ''),
+      url: folderUrl,
+      id: folderUrl.match(/folder\/([0-9]*)\/list/)[1],
+      rootFolderId: rootFolder.id,
+      files: [],
+      subfolders: [],
+    };
+    
+    if (Object.values(newFolder).some(v => !v))
+      throw new Error('There was a problem parsing the folder: ' + JSON.stringify(newFolder, null, 2));
+    
+    return newFolder;
+  }
+  
+  async getFolderContents(folder: Folder, recursive = true) {
+    const folderHtml = await this.getHtmlForFolder(folder);
     const $ = cheerio.load(folderHtml);
-  
+    
     // get files
     const fileLinks = $('li.file > a[data-automation="file-name"]');
-    fileLinks.each((i, link) => {
-      const name = link.firstChild.data;
-      const url = link.attribs.href;
+    fileLinks.each((i, link) => folder.files.push(this.getFileInfoFromElement(link, folder)));
     
-      const newFile: File = { name, url, rootFolderId: folder.id };
-      folder.files.push(newFile);
-    });
-  
     // populate subfolders
+    // we need to go recursively through the subfolders, *asynchronously*
+    // so we need to use a for loop not a forEach or cheerio.Element[].each
     const folderLinks = $('li.folder > a[data-automation="file-name"]');
-  
     const folderEls: cheerio.Element[] = [];
-  
     folderLinks.each((i, link) => folderEls.push(link));
-  
+    
     for (const link of folderEls) {
-      const folderName = link.firstChild.data;
-      const folderUrl = link.attribs.href;
-    
-      const newFolder: Folder = {
-        // move leading number to the end, in parens
-        // delete those parens if they're empty.
-        name: folderName.replace(/([0-9]*)\s(.*)/, '$2 ($1)').replace(' ()', ''),
-        url: folderUrl,
-        id: folderUrl.match(/folder\/([0-9]*)\/list/)[1],
-        rootFolderId: folder.id,
-        files: [],
-        subfolders: [],
-      };
-    
-      if (Object.values(newFolder).some(v => !v))
-        throw new Error('There was a problem parsing the folder: ' + JSON.stringify(newFolder, null, 2));
-    
+      const newFolder = this.getFolderInfoFromElement(link, folder);
+      
       folder.subfolders.push(newFolder);
-    
-      if (recursive)
-        await this.getFolderContents(newFolder);
+      
+      // I suppose we could recur inside getFolderInfoFromElement
+      // But that would have to get the folder's files too, and while
+      // that would probably work fine, it's a little more confusing
+      // than I'd like.
+      if (recursive) await this.getFolderContents(newFolder);
     }
   }
 }
