@@ -1,11 +1,13 @@
 import Redis from 'ioredis';
 import { HuddleParser } from './HuddleParser';
+import HuddleDatabase from './HuddleDatabase';
 
+// eslint-disable-next-line prefer-const
 let ALWAYS_FETCH = false;
 
 const redis = new Redis(); // uses defaults unless given configuration object
 
-async function run() {
+async function parse() {
   
   // ALWAYS_FETCH = true;
   
@@ -14,11 +16,13 @@ async function run() {
   await parser.populateRootFolders();
 }
 
-async function inspect() {
-  const data = await redis.get('folder:root');
-  const root = JSON.parse(data);
-  console.log(root);
-}
+const db = new HuddleDatabase(redis);
+db.getCurrent()
+  .then(() => db.createFolderTable())
+  .then(() => console.log(db.huddle));
+
+console.log(db.huddle);
 
 // run().then(inspect);
-inspect()
+// inspect()
+

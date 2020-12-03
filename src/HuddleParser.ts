@@ -1,28 +1,10 @@
 import cheerio from 'cheerio';
 import puppeteer from 'puppeteer';
 import Redis from 'ioredis';
+import { File, Folder, HuddleInstance } from './types';
 
 const delay = (time: number) => new Promise(resolve => setTimeout(resolve, time));
 const urlForFolder = (folderNumber: string) => `${ process.env.HUDDLE_ROOT }#/folder/${ folderNumber }/list`;
-
-type File = {
-  name: string;
-  url: string;
-  rootFolderId: string;
-}
-
-type Folder = {
-  name: string;
-  url: string;
-  id: string;
-  subfolders: Folder[];
-  files: File[];
-  rootFolderId: string;
-}
-
-type HuddleInstance = {
-  rootFolder: Folder;
-}
 
 export class HuddleParser {
   
@@ -91,12 +73,8 @@ export class HuddleParser {
     }
   
     const data = JSON.stringify(this.huddle.rootFolder);
-    await this.redis.set('folder:root', data);
-    await this.redis.set('history:folder:root:' + new Date().toISOString(), data);
-  
-    // this doesn't seem to set different scores each time and just overwrites the existing element.
-    // that's why we're covering our bases above.
-    await this.redis.zadd('history:folder:root', new Date().toISOString(), data);
+    await this.redis.set('folder-object:root', data);
+    await this.redis.set('history:folder-object:root:' + new Date().toISOString(), data);
   
     console.log('Done');
   }
